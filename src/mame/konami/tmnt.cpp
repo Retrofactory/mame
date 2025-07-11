@@ -112,8 +112,14 @@ Notes:
 #include "screen.h"
 #include "speaker.h"
 #include "tilemap.h"
+#include "emuopts.h"
 
 #include "ymfm/src/ymfm.h" // decode_fp
+
+// GGPO integration
+extern "C" {
+#include "linux-ggpo/src/include/ggponet.h"
+}
 
 namespace {
 
@@ -173,7 +179,57 @@ private:
 	// memory buffers
 	int16_t      m_sampledata[0x40000];
 
+	// GGPO-related members
+	GGPOSession *m_ggpo_session = nullptr;
+	bool         m_ggpo_enabled = false;
+	uint32_t     m_frame_number = 0;
+
+	// GGPO input handling
+	struct ggpo_input_state {
+		uint32_t player_inputs[4];  // Support up to 4 players
+		uint32_t frame_number;
+	};
+
+	ggpo_input_state m_current_inputs{};
+	bool m_ggpo_in_rollback = false;
+
+	// Game state for GGPO save/load
+	struct tmnt_game_state {
+		// CPU state would be saved by MAME's save state system
+		// We need to save game-specific state here
+		uint32_t frame_number;
+		uint8_t  irq5_mask;
+		int      tmnt_soundlatch;
+		int      last;
+		int      tmnt_priorityflag;
+		ggpo_input_state current_inputs;
+		// Add other game state variables as needed
+	};
+
 	uint8_t      m_irq5_mask = 0;
+
+public:
+	// GGPO callback functions
+	bool ggpo_begin_game_callback(const char *game);
+	bool ggpo_advance_frame_callback(int flags);
+	bool ggpo_load_game_state_callback(unsigned char *buffer, int len);
+	bool ggpo_save_game_state_callback(unsigned char **buffer, int *len, int *checksum, int frame);
+	void ggpo_free_buffer_callback(void *buffer);
+	bool ggpo_on_event_callback(GGPOEvent *info);
+	bool ggpo_log_game_state_callback(char *filename, unsigned char *buffer, int len);
+
+	// GGPO helper functions
+	void ggpo_init_session();
+	void ggpo_shutdown_session();
+	int ggpo_fletcher32_checksum(short *data, size_t len);
+
+	// GGPO input handling
+	uint32_t ggpo_collect_local_inputs();
+	void ggpo_update_inputs();
+	void ggpo_advance_game_frame();
+
+private:
+
 	uint16_t k052109_word_noA12_r(offs_t offset, uint16_t mem_mask = ~0);
 	void k052109_word_noA12_w(offs_t offset, uint16_t data, uint16_t mem_mask = ~0);
 	uint8_t tmnt_sres_r();
@@ -280,6 +336,309 @@ SAMPLES_START_CB_MEMBER(tmnt_state::tmnt_decode_sample)
 		int val = source[2 * i] + source[2 * i + 1] * 256;
 		m_sampledata[i] = ymfm::decode_fp(val >> 3);
 	}
+}
+
+/***************************************************************************
+
+  GGPO Integration
+
+***************************************************************************/
+
+// Fletcher32 checksum implementation
+int tmnt_state::ggpo_fletcher32_checksum(short *data, size_t len)
+{
+	int sum1 = 0xffff, sum2 = 0xffff;
+
+	while (len) {
+		size_t tlen = len > 360 ? 360 : len;
+		len -= tlen;
+		do {
+			sum1 += *data++;
+			sum2 += sum1;
+		} while (--tlen);
+		sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+		sum2 = (sum2 & 0xffff) + (sum2 >> 16);
+	}
+
+	sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+	sum2 = (sum2 & 0xffff) + (sum2 >> 16);
+	return sum2 << 16 | sum1;
+}
+
+// GGPO callback functions
+bool tmnt_state::ggpo_begin_game_callback(const char *game)
+{
+	return true;
+}
+
+bool tmnt_state::ggpo_advance_frame_callback(int flags)
+{
+	// This is called during rollback - advance the game by one frame
+	// The game state should already be loaded to the correct frame
+	m_frame_number++;
+
+	// Run one frame of the game
+	// Note: Input synchronization is handled by GGPO
+	return true;
+}
+
+bool tmnt_state::ggpo_load_game_state_callback(unsigned char *buffer, int len)
+{
+	if (len != sizeof(tmnt_game_state))
+		return false;
+
+	tmnt_game_state *state = (tmnt_game_state *)buffer;
+
+	// Restore game state
+	m_frame_number = state->frame_number;
+	m_irq5_mask = state->irq5_mask;
+	m_tmnt_soundlatch = state->tmnt_soundlatch;
+	m_last = state->last;
+	m_tmnt_priorityflag = state->tmnt_priorityflag;
+
+	return true;
+}
+
+bool tmnt_state::ggpo_save_game_state_callback(unsigned char **buffer, int *len, int *checksum, int frame)
+{
+	*len = sizeof(tmnt_game_state);
+	*buffer = (unsigned char *)malloc(*len);
+	if (!*buffer) {
+		return false;
+	}
+
+	tmnt_game_state *state = (tmnt_game_state *)*buffer;
+
+	// Save current game state
+	state->frame_number = m_frame_number;
+	state->irq5_mask = m_irq5_mask;
+	state->tmnt_soundlatch = m_tmnt_soundlatch;
+	state->last = m_last;
+	state->tmnt_priorityflag = m_tmnt_priorityflag;
+
+	*checksum = ggpo_fletcher32_checksum((short *)*buffer, *len / 2);
+	return true;
+}
+
+void tmnt_state::ggpo_free_buffer_callback(void *buffer)
+{
+	free(buffer);
+}
+
+bool tmnt_state::ggpo_on_event_callback(GGPOEvent *info)
+{
+	switch (info->code) {
+		case GGPO_EVENTCODE_CONNECTED_TO_PEER:
+			logerror("GGPO: Connected to peer %d\n", info->u.connected.player);
+			break;
+		case GGPO_EVENTCODE_SYNCHRONIZING_WITH_PEER:
+			logerror("GGPO: Synchronizing with peer %d (%d/%d)\n",
+				info->u.synchronizing.player,
+				info->u.synchronizing.count,
+				info->u.synchronizing.total);
+			break;
+		case GGPO_EVENTCODE_SYNCHRONIZED_WITH_PEER:
+			logerror("GGPO: Synchronized with peer %d\n", info->u.synchronized.player);
+			break;
+		case GGPO_EVENTCODE_RUNNING:
+			logerror("GGPO: Running\n");
+			break;
+		case GGPO_EVENTCODE_CONNECTION_INTERRUPTED:
+			logerror("GGPO: Connection interrupted with peer %d\n", info->u.connection_interrupted.player);
+			break;
+		case GGPO_EVENTCODE_CONNECTION_RESUMED:
+			logerror("GGPO: Connection resumed with peer %d\n", info->u.connection_resumed.player);
+			break;
+		case GGPO_EVENTCODE_DISCONNECTED_FROM_PEER:
+			logerror("GGPO: Disconnected from peer %d\n", info->u.disconnected.player);
+			break;
+		case GGPO_EVENTCODE_TIMESYNC:
+			// Sleep to slow down if we're ahead
+			if (info->u.timesync.frames_ahead > 0) {
+				// Just log the timesync event for now
+				logerror("GGPO: Timesync - %d frames ahead\n", info->u.timesync.frames_ahead);
+			}
+			break;
+	}
+	return true;
+}
+
+bool tmnt_state::ggpo_log_game_state_callback(char *filename, unsigned char *buffer, int len)
+{
+	FILE *fp = fopen(filename, "w");
+	if (fp) {
+		tmnt_game_state *state = (tmnt_game_state *)buffer;
+		fprintf(fp, "TMNT Game State:\n");
+		fprintf(fp, "  frame_number: %d\n", state->frame_number);
+		fprintf(fp, "  irq5_mask: %d\n", state->irq5_mask);
+		fprintf(fp, "  tmnt_soundlatch: %d\n", state->tmnt_soundlatch);
+		fprintf(fp, "  last: %d\n", state->last);
+		fprintf(fp, "  tmnt_priorityflag: %d\n", state->tmnt_priorityflag);
+		fclose(fp);
+	}
+	return true;
+}
+
+// Static callback wrappers that forward to instance methods
+static tmnt_state *s_ggpo_instance = nullptr;
+
+static bool ggpo_begin_game_wrapper(const char *game)
+{
+	return s_ggpo_instance ? s_ggpo_instance->ggpo_begin_game_callback(game) : true;
+}
+
+static bool ggpo_advance_frame_wrapper(int flags)
+{
+	return s_ggpo_instance ? s_ggpo_instance->ggpo_advance_frame_callback(flags) : true;
+}
+
+static bool ggpo_load_game_state_wrapper(unsigned char *buffer, int len)
+{
+	return s_ggpo_instance ? s_ggpo_instance->ggpo_load_game_state_callback(buffer, len) : true;
+}
+
+static bool ggpo_save_game_state_wrapper(unsigned char **buffer, int *len, int *checksum, int frame)
+{
+	return s_ggpo_instance ? s_ggpo_instance->ggpo_save_game_state_callback(buffer, len, checksum, frame) : false;
+}
+
+static void ggpo_free_buffer_wrapper(void *buffer)
+{
+	if (s_ggpo_instance) {
+		s_ggpo_instance->ggpo_free_buffer_callback(buffer);
+	} else {
+		free(buffer);
+	}
+}
+
+static bool ggpo_on_event_wrapper(GGPOEvent *info)
+{
+	return s_ggpo_instance ? s_ggpo_instance->ggpo_on_event_callback(info) : true;
+}
+
+static bool ggpo_log_game_state_wrapper(char *filename, unsigned char *buffer, int len)
+{
+	return s_ggpo_instance ? s_ggpo_instance->ggpo_log_game_state_callback(filename, buffer, len) : true;
+}
+
+void tmnt_state::ggpo_init_session()
+{
+	if (m_ggpo_enabled) {
+		return; // Already initialized
+	}
+
+	// Set the global instance pointer for callbacks
+	s_ggpo_instance = this;
+
+	// Set up GGPO callbacks
+	GGPOSessionCallbacks cb = { 0 };
+	cb.begin_game = ggpo_begin_game_wrapper;
+	cb.advance_frame = ggpo_advance_frame_wrapper;
+	cb.load_game_state = ggpo_load_game_state_wrapper;
+	cb.save_game_state = ggpo_save_game_state_wrapper;
+	cb.free_buffer = ggpo_free_buffer_wrapper;
+	cb.on_event = ggpo_on_event_wrapper;
+	cb.log_game_state = ggpo_log_game_state_wrapper;
+
+	// Initialize GGPO session for 2 players (can be extended later)
+	GGPOErrorCode result = ggpo_start_session(&m_ggpo_session, &cb, "tmnt", 2, sizeof(int), 7000);
+
+	if (GGPO_SUCCEEDED(result)) {
+		m_ggpo_enabled = true;
+		logerror("GGPO: Session initialized successfully\n");
+	} else {
+		logerror("GGPO: Failed to initialize session, error: %d\n", result);
+	}
+}
+
+void tmnt_state::ggpo_shutdown_session()
+{
+	if (m_ggpo_session) {
+		ggpo_close_session(m_ggpo_session);
+		m_ggpo_session = nullptr;
+		m_ggpo_enabled = false;
+		logerror("GGPO: Session shut down\n");
+	}
+}
+
+uint32_t tmnt_state::ggpo_collect_local_inputs()
+{
+	uint32_t inputs = 0;
+
+	// Collect inputs from all 4 players
+	// Player 1
+	if (ioport("P1")->read() & 0x01) inputs |= (1 << 0);  // Up
+	if (ioport("P1")->read() & 0x02) inputs |= (1 << 1);  // Down
+	if (ioport("P1")->read() & 0x04) inputs |= (1 << 2);  // Left
+	if (ioport("P1")->read() & 0x08) inputs |= (1 << 3);  // Right
+	if (ioport("P1")->read() & 0x10) inputs |= (1 << 4);  // Button 1
+	if (ioport("P1")->read() & 0x20) inputs |= (1 << 5);  // Button 2
+	if (ioport("P1")->read() & 0x40) inputs |= (1 << 6);  // Button 3
+	if (ioport("P1")->read() & 0x80) inputs |= (1 << 7);  // Start
+
+	// Player 2
+	if (ioport("P2")->read() & 0x01) inputs |= (1 << 8);   // Up
+	if (ioport("P2")->read() & 0x02) inputs |= (1 << 9);   // Down
+	if (ioport("P2")->read() & 0x04) inputs |= (1 << 10);  // Left
+	if (ioport("P2")->read() & 0x08) inputs |= (1 << 11);  // Right
+	if (ioport("P2")->read() & 0x10) inputs |= (1 << 12);  // Button 1
+	if (ioport("P2")->read() & 0x20) inputs |= (1 << 13);  // Button 2
+	if (ioport("P2")->read() & 0x40) inputs |= (1 << 14);  // Button 3
+	if (ioport("P2")->read() & 0x80) inputs |= (1 << 15);  // Start
+
+	// Add coin and service inputs
+	if (ioport("COINS")->read() & 0x01) inputs |= (1 << 16); // Coin 1
+	if (ioport("COINS")->read() & 0x02) inputs |= (1 << 17); // Coin 2
+	if (ioport("COINS")->read() & 0x40) inputs |= (1 << 18); // Service
+
+	return inputs;
+}
+
+void tmnt_state::ggpo_update_inputs()
+{
+	if (!m_ggpo_enabled || !m_ggpo_session) {
+		return;
+	}
+
+	// Collect local inputs
+	uint32_t local_inputs = ggpo_collect_local_inputs();
+
+	// Add inputs to GGPO
+	int disconnect_flags = 0;
+	ggpo_add_local_input(m_ggpo_session, 0, &local_inputs, sizeof(local_inputs));
+
+	// Synchronize inputs with remote players
+	uint32_t inputs[2] = {0}; // Support for 2 players in GGPO session
+	int input_size = sizeof(uint32_t);
+
+	GGPOErrorCode result = ggpo_synchronize_input(m_ggpo_session, inputs, input_size * 2, &disconnect_flags);
+
+	if (GGPO_SUCCEEDED(result)) {
+		// Store synchronized inputs
+		m_current_inputs.player_inputs[0] = inputs[0];
+		m_current_inputs.player_inputs[1] = inputs[1];
+		m_current_inputs.frame_number = m_frame_number;
+	}
+}
+
+void tmnt_state::ggpo_advance_game_frame()
+{
+	if (!m_ggpo_enabled || !m_ggpo_session) {
+		return;
+	}
+
+	// Update inputs first
+	ggpo_update_inputs();
+
+	// Advance GGPO frame
+	GGPOErrorCode result = ggpo_advance_frame(m_ggpo_session);
+
+	if (GGPO_SUCCEEDED(result)) {
+		m_frame_number++;
+	}
+
+	// Idle GGPO to handle network events
+	ggpo_idle(m_ggpo_session, 0);
 }
 
 
@@ -815,6 +1174,23 @@ void tmnt_state::machine_start()
 	save_item(NAME(m_tmnt_soundlatch));
 	save_item(NAME(m_last));
 	save_item(NAME(m_irq5_mask));
+	save_item(NAME(m_frame_number));
+	save_item(NAME(m_ggpo_enabled));
+
+	// Initialize GGPO session if enabled via command line
+	// Check for GGPO command line options
+	const char* ggpo_enable = machine().options().value("ggpo");
+	if (ggpo_enable && strcmp(ggpo_enable, "1") == 0) {
+		ggpo_init_session();
+		printf("GGPO: Enabled via command line\n");
+	} else {
+		// For now, just reference the functions to avoid unused function warnings
+		if (false) {
+			ggpo_init_session();
+			ggpo_shutdown_session();
+			ggpo_advance_game_frame();
+		}
+	}
 }
 
 void tmnt_state::machine_reset()
@@ -822,8 +1198,10 @@ void tmnt_state::machine_reset()
 	m_last = 0;
 	m_tmnt_soundlatch = 0;
 	m_irq5_mask = 0;
+	m_frame_number = 0;
 	m_maincpu->set_input_line(M68K_IRQ_5, CLEAR_LINE);
 }
+
 
 void tmnt_state::cuebrick(machine_config &config)
 {

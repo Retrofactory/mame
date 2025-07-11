@@ -128,6 +128,7 @@ const options_entry cli_option_entries[] =
 
 	{ nullptr,                              nullptr,   core_options::option_type::HEADER,     "FRONTEND COMMAND OPTIONS" },
 	{ CLIOPTION_DTD,                        "1",       core_options::option_type::BOOLEAN,    "include DTD in XML output" },
+	{ "ggpo",                               "0",       core_options::option_type::BOOLEAN,    "enable GGPO rollback netcode" },
 	{ nullptr }
 };
 

@@ -168,6 +168,7 @@ end
 		ext_lib("zstd"),
 		ext_lib("flac"),
 		ext_lib("utf8proc"),
+		ext_lib("linux-ggpo"),
 	}
 if (STANDALONE~=true) then
 	links {
