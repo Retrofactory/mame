@@ -82,7 +82,8 @@ function createMAMEProjects(_target, _subtarget, _name)
 		ext_includedir("glm"),
 		ext_includedir("jpeg"),
 		ext_includedir("rapidjson"),
-		ext_includedir("zlib")
+		ext_includedir("zlib"),
+		ext_includedir("linux-ggpo"),
 	}
 
 end

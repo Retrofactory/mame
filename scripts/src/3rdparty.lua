@@ -108,6 +108,37 @@ end
 
 
 --------------------------------------------------
+-- linux-ggpo library objects
+--------------------------------------------------
+
+if not _OPTIONS["with-system-linux-ggpo"] then
+
+project "linux-ggpo"
+	uuid "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+	kind "StaticLib"
+
+	configuration { }
+		defines {
+			"LINUX_GGPO",
+		}
+
+	includedirs {
+		MAME_DIR .. "3rdparty/linux-ggpo/src/include",
+		MAME_DIR .. "3rdparty/linux-ggpo/src/lib/ggpo",
+	}
+
+	files {
+		MAME_DIR .. "3rdparty/linux-ggpo/src/lib/ggpo/**.cpp",
+		MAME_DIR .. "3rdparty/linux-ggpo/src/lib/ggpo/**.h",
+	}
+
+else
+	links {
+		ext_lib("libGGPO"),
+	}
+end
+
+--------------------------------------------------
 -- zlib library objects
 --------------------------------------------------
 
