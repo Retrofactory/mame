@@ -148,6 +148,8 @@ public:
 	void init_tmnt();
 	void init_cuebrick();
 
+	virtual ~tmnt_state();
+
 protected:
 	virtual void machine_start() override;
 	virtual void machine_reset() override;
@@ -193,18 +195,13 @@ private:
 	ggpo_input_state m_current_inputs{};
 	bool m_ggpo_in_rollback = false;
 
-	// Game state for GGPO save/load
-	struct tmnt_game_state {
-		// CPU state would be saved by MAME's save state system
-		// We need to save game-specific state here
-		uint32_t frame_number;
-		uint8_t  irq5_mask;
-		int      tmnt_soundlatch;
-		int      last;
-		int      tmnt_priorityflag;
-		ggpo_input_state current_inputs;
-		// Add other game state variables as needed
-	};
+	// Override input ports when GGPO is active
+	uint32_t m_ggpo_override_inputs[4]{};
+	bool m_ggpo_inputs_valid = false;
+
+	// Game state for GGPO save/load - we need to save the complete machine state
+	// This will be a buffer containing MAME's complete save state
+	std::vector<uint8_t> m_ggpo_state_buffer;
 
 	uint8_t      m_irq5_mask = 0;
 
@@ -260,6 +257,13 @@ private:
 	void tmnt_audio_map(address_map &map);
 	void tmntucbl_audio_map(address_map &map);
 	void tmnt_main_map(address_map &map);
+
+	// GGPO input port overrides
+	uint16_t ggpo_coins_r();
+	uint16_t ggpo_p1_r();
+	uint16_t ggpo_p2_r();
+	uint16_t ggpo_p3_r();
+	uint16_t ggpo_p4_r();
 };
 
 uint16_t tmnt_state::k052109_word_noA12_r(offs_t offset, uint16_t mem_mask)
@@ -289,6 +293,11 @@ void tmnt_state::tmnt_vblank_w(int state)
 {
 	if (state && m_irq5_mask)
 		m_maincpu->set_input_line(M68K_IRQ_5, ASSERT_LINE);
+
+	// GGPO frame advancement - call this every VBlank
+	if (state) {
+		ggpo_advance_game_frame();
+	}
 }
 
 
@@ -384,40 +393,72 @@ bool tmnt_state::ggpo_advance_frame_callback(int flags)
 
 bool tmnt_state::ggpo_load_game_state_callback(unsigned char *buffer, int len)
 {
-	if (len != sizeof(tmnt_game_state))
+	printf("GGPO: *** LOADING COMPLETE MACHINE STATE *** (buffer size: %d bytes)\n", len);
+
+	try {
+		// Use MAME's built-in state loading mechanism
+		save_error result = machine().save().read_buffer(buffer, len);
+
+		if (result == STATERR_NONE) {
+			printf("GGPO: *** COMPLETE MACHINE STATE LOADED *** (size: %d bytes)\n", len);
+			logerror("GGPO: Loaded complete machine state (size: %d bytes)\n", len);
+			return true;
+		} else {
+			printf("GGPO: ERROR - Failed to load state, save_error: %d\n", result);
+			return false;
+		}
+	}
+	catch (std::exception &ex) {
+		printf("GGPO: ERROR - Exception during state load: %s\n", ex.what());
 		return false;
-
-	tmnt_game_state *state = (tmnt_game_state *)buffer;
-
-	// Restore game state
-	m_frame_number = state->frame_number;
-	m_irq5_mask = state->irq5_mask;
-	m_tmnt_soundlatch = state->tmnt_soundlatch;
-	m_last = state->last;
-	m_tmnt_priorityflag = state->tmnt_priorityflag;
-
-	return true;
+	}
 }
 
 bool tmnt_state::ggpo_save_game_state_callback(unsigned char **buffer, int *len, int *checksum, int frame)
 {
-	*len = sizeof(tmnt_game_state);
-	*buffer = (unsigned char *)malloc(*len);
-	if (!*buffer) {
+	printf("GGPO: *** SAVING COMPLETE MACHINE STATE *** for frame %d\n", frame);
+
+	try {
+		// Use MAME's built-in state saving mechanism
+		// First, calculate the required buffer size
+		size_t required_size = 0;
+		save_error result = machine().save().write_buffer(nullptr, required_size);
+
+		if (result != STATERR_NONE) {
+			printf("GGPO: ERROR - Failed to calculate save state size, save_error: %d\n", result);
+			return false;
+		}
+
+		// Allocate buffer
+		*len = required_size;
+		*buffer = (unsigned char *)malloc(*len);
+		if (!*buffer) {
+			printf("GGPO: ERROR - Failed to allocate save state buffer (%d bytes)\n", *len);
+			return false;
+		}
+
+		// Save the complete machine state
+		result = machine().save().write_buffer(*buffer, required_size);
+
+		if (result != STATERR_NONE) {
+			printf("GGPO: ERROR - Failed to save state, save_error: %d\n", result);
+			free(*buffer);
+			*buffer = nullptr;
+			return false;
+		}
+
+		// Calculate checksum
+		*checksum = ggpo_fletcher32_checksum((short *)*buffer, *len / 2);
+
+		printf("GGPO: *** COMPLETE MACHINE STATE SAVED *** (size: %d bytes, checksum: 0x%08x)\n", *len, *checksum);
+		logerror("GGPO: Saved complete machine state for frame %d (size: %d bytes, checksum: 0x%08x)\n", frame, *len, *checksum);
+
+		return true;
+	}
+	catch (std::exception &ex) {
+		printf("GGPO: ERROR - Exception during state save: %s\n", ex.what());
 		return false;
 	}
-
-	tmnt_game_state *state = (tmnt_game_state *)*buffer;
-
-	// Save current game state
-	state->frame_number = m_frame_number;
-	state->irq5_mask = m_irq5_mask;
-	state->tmnt_soundlatch = m_tmnt_soundlatch;
-	state->last = m_last;
-	state->tmnt_priorityflag = m_tmnt_priorityflag;
-
-	*checksum = ggpo_fletcher32_checksum((short *)*buffer, *len / 2);
-	return true;
 }
 
 void tmnt_state::ggpo_free_buffer_callback(void *buffer)
@@ -467,13 +508,13 @@ bool tmnt_state::ggpo_log_game_state_callback(char *filename, unsigned char *buf
 {
 	FILE *fp = fopen(filename, "w");
 	if (fp) {
-		tmnt_game_state *state = (tmnt_game_state *)buffer;
 		fprintf(fp, "TMNT Game State:\n");
-		fprintf(fp, "  frame_number: %d\n", state->frame_number);
-		fprintf(fp, "  irq5_mask: %d\n", state->irq5_mask);
-		fprintf(fp, "  tmnt_soundlatch: %d\n", state->tmnt_soundlatch);
-		fprintf(fp, "  last: %d\n", state->last);
-		fprintf(fp, "  tmnt_priorityflag: %d\n", state->tmnt_priorityflag);
+		fprintf(fp, "  buffer_size: %d bytes\n", len);
+		fprintf(fp, "  frame_number: %d\n", m_frame_number);
+		fprintf(fp, "  irq5_mask: %d\n", m_irq5_mask);
+		fprintf(fp, "  tmnt_soundlatch: %d\n", m_tmnt_soundlatch);
+		fprintf(fp, "  last: %d\n", m_last);
+		fprintf(fp, "  tmnt_priorityflag: %d\n", m_tmnt_priorityflag);
 		fclose(fp);
 	}
 	return true;
@@ -540,12 +581,72 @@ void tmnt_state::ggpo_init_session()
 	cb.on_event = ggpo_on_event_wrapper;
 	cb.log_game_state = ggpo_log_game_state_wrapper;
 
-	// Initialize GGPO session for 2 players (can be extended later)
-	GGPOErrorCode result = ggpo_start_session(&m_ggpo_session, &cb, "tmnt", 2, sizeof(int), 7000);
+	// Get network configuration from command line options
+	const char* ggpo_port_str = machine().options().value("ggpo_port");
+	const char* ggpo_remote_ip = machine().options().value("ggpo_remote_ip");
+	const char* ggpo_remote_port_str = machine().options().value("ggpo_remote_port");
+
+	int local_port = ggpo_port_str ? atoi(ggpo_port_str) : 7000;
+	int remote_port = ggpo_remote_port_str ? atoi(ggpo_remote_port_str) : 7001;
+
+	// Initialize GGPO session for 2 players
+	GGPOErrorCode result = ggpo_start_session(&m_ggpo_session, &cb, "tmnt", 2, sizeof(uint32_t), local_port);
 
 	if (GGPO_SUCCEEDED(result)) {
-		m_ggpo_enabled = true;
-		logerror("GGPO: Session initialized successfully\n");
+		// Set up players
+		GGPOPlayer players[2];
+		GGPOPlayerHandle player_handles[2];
+
+		// Player 0 (local) - GGPO uses 0-based indexing
+		players[0].size = sizeof(GGPOPlayer);
+		players[0].type = GGPO_PLAYERTYPE_LOCAL;
+		players[0].player_num = 0;  // CRITICAL FIX: Use 0-based indexing
+		result = ggpo_add_player(m_ggpo_session, &players[0], &player_handles[0]);
+
+		if (GGPO_SUCCEEDED(result)) {
+			logerror("GGPO: Added local player 0\n");
+
+			// Set frame delay for local player
+			ggpo_set_frame_delay(m_ggpo_session, player_handles[0], 2);
+
+			// Player 1 (remote) - only add if we have remote IP
+			if (ggpo_remote_ip && strlen(ggpo_remote_ip) > 0) {
+				players[1].size = sizeof(GGPOPlayer);
+				players[1].type = GGPO_PLAYERTYPE_REMOTE;
+				players[1].player_num = 1;  // CRITICAL FIX: Use 0-based indexing
+				strncpy(players[1].u.remote.ip_address, ggpo_remote_ip, sizeof(players[1].u.remote.ip_address) - 1);
+				players[1].u.remote.ip_address[sizeof(players[1].u.remote.ip_address) - 1] = '\0';
+				players[1].u.remote.port = remote_port;
+
+				result = ggpo_add_player(m_ggpo_session, &players[1], &player_handles[1]);
+
+				if (GGPO_SUCCEEDED(result)) {
+					logerror("GGPO: Added remote player 1 at %s:%d\n", ggpo_remote_ip, remote_port);
+				} else {
+					logerror("GGPO: Failed to add remote player 1, error: %d\n", result);
+				}
+			} else {
+				// For testing, add a spectator or wait for connection
+				logerror("GGPO: No remote IP specified, adding spectator for testing...\n");
+				players[1].size = sizeof(GGPOPlayer);
+				players[1].type = GGPO_PLAYERTYPE_SPECTATOR;
+				players[1].player_num = 1;
+				result = ggpo_add_player(m_ggpo_session, &players[1], &player_handles[1]);
+
+				if (GGPO_SUCCEEDED(result)) {
+					logerror("GGPO: Added spectator player 1 for testing\n");
+				}
+			}
+		}
+
+		if (GGPO_SUCCEEDED(result)) {
+			m_ggpo_enabled = true;
+			printf("GGPO: *** SESSION FULLY INITIALIZED *** m_ggpo_enabled = true\n");
+			logerror("GGPO: Session initialized successfully on port %d\n", local_port);
+		} else {
+			printf("GGPO: *** FAILED TO ADD PLAYERS *** error: %d\n", result);
+			logerror("GGPO: Failed to add players, error: %d\n", result);
+		}
 	} else {
 		logerror("GGPO: Failed to initialize session, error: %d\n", result);
 	}
@@ -565,31 +666,71 @@ uint32_t tmnt_state::ggpo_collect_local_inputs()
 {
 	uint32_t inputs = 0;
 
-	// Collect inputs from all 4 players
-	// Player 1
-	if (ioport("P1")->read() & 0x01) inputs |= (1 << 0);  // Up
-	if (ioport("P1")->read() & 0x02) inputs |= (1 << 1);  // Down
-	if (ioport("P1")->read() & 0x04) inputs |= (1 << 2);  // Left
-	if (ioport("P1")->read() & 0x08) inputs |= (1 << 3);  // Right
-	if (ioport("P1")->read() & 0x10) inputs |= (1 << 4);  // Button 1
-	if (ioport("P1")->read() & 0x20) inputs |= (1 << 5);  // Button 2
-	if (ioport("P1")->read() & 0x40) inputs |= (1 << 6);  // Button 3
-	if (ioport("P1")->read() & 0x80) inputs |= (1 << 7);  // Start
+	// CRITICAL FIX: We need to read the RAW input ports directly from MAME's input system
+	// NOT from our overridden ports, which would create a circular dependency!
 
-	// Player 2
-	if (ioport("P2")->read() & 0x01) inputs |= (1 << 8);   // Up
-	if (ioport("P2")->read() & 0x02) inputs |= (1 << 9);   // Down
-	if (ioport("P2")->read() & 0x04) inputs |= (1 << 10);  // Left
-	if (ioport("P2")->read() & 0x08) inputs |= (1 << 11);  // Right
-	if (ioport("P2")->read() & 0x10) inputs |= (1 << 12);  // Button 1
-	if (ioport("P2")->read() & 0x20) inputs |= (1 << 13);  // Button 2
-	if (ioport("P2")->read() & 0x40) inputs |= (1 << 14);  // Button 3
-	if (ioport("P2")->read() & 0x80) inputs |= (1 << 15);  // Start
+	// Get the raw input port values directly from MAME's input system
+	// This bypasses our GGPO override functions and reads the actual hardware inputs
+	ioport_port *p1_port = ioport("P1");
+	ioport_port *p2_port = ioport("P2");
+	ioport_port *coins_port = ioport("COINS");
 
-	// Add coin and service inputs
-	if (ioport("COINS")->read() & 0x01) inputs |= (1 << 16); // Coin 1
-	if (ioport("COINS")->read() & 0x02) inputs |= (1 << 17); // Coin 2
-	if (ioport("COINS")->read() & 0x40) inputs |= (1 << 18); // Service
+	// Read the live input values (what the player is actually pressing)
+	uint16_t p1_raw = p1_port->read();
+	uint16_t p2_raw = p2_port->read();
+	uint16_t coins_raw = coins_port->read();
+
+	printf("GGPO: Collecting inputs - P1_raw: 0x%02x, P2_raw: 0x%02x, COINS_raw: 0x%02x\n",
+		p1_raw, p2_raw, coins_raw);
+
+	// TMNT uses active-low inputs, so we need to invert the logic
+	// When a button is pressed, the bit is 0 (active-low)
+	// We want to set our bit to 1 when the button is pressed
+
+	// IMPORTANT: The bit mapping is based on KONAMI16_LSB macro:
+	// Bit 0 = LEFT, Bit 1 = RIGHT, Bit 2 = UP, Bit 3 = DOWN
+	// Bit 4 = BUTTON1, Bit 5 = BUTTON2, Bit 6 = BUTTON3, Bit 7 = START
+
+	// Player 1 - invert the bits since TMNT uses active-low
+	if (!(p1_raw & 0x01)) inputs |= (1 << 0);  // LEFT
+	if (!(p1_raw & 0x02)) inputs |= (1 << 1);  // RIGHT
+	if (!(p1_raw & 0x04)) inputs |= (1 << 2);  // UP
+	if (!(p1_raw & 0x08)) inputs |= (1 << 3);  // DOWN
+	if (!(p1_raw & 0x10)) inputs |= (1 << 4);  // BUTTON1
+	if (!(p1_raw & 0x20)) inputs |= (1 << 5);  // BUTTON2
+	if (!(p1_raw & 0x40)) inputs |= (1 << 6);  // BUTTON3
+	if (!(p1_raw & 0x80)) inputs |= (1 << 7);  // START
+
+	// Player 2 - invert the bits since TMNT uses active-low
+	if (!(p2_raw & 0x01)) inputs |= (1 << 8);   // LEFT
+	if (!(p2_raw & 0x02)) inputs |= (1 << 9);   // RIGHT
+	if (!(p2_raw & 0x04)) inputs |= (1 << 10);  // UP
+	if (!(p2_raw & 0x08)) inputs |= (1 << 11);  // DOWN
+	if (!(p2_raw & 0x10)) inputs |= (1 << 12);  // BUTTON1
+	if (!(p2_raw & 0x20)) inputs |= (1 << 13);  // BUTTON2
+	if (!(p2_raw & 0x40)) inputs |= (1 << 14);  // BUTTON3
+	if (!(p2_raw & 0x80)) inputs |= (1 << 15);  // START
+
+	// Coin and service inputs - invert the bits since TMNT uses active-low
+	if (!(coins_raw & 0x01)) inputs |= (1 << 16); // Coin 1
+	if (!(coins_raw & 0x02)) inputs |= (1 << 17); // Coin 2
+	if (!(coins_raw & 0x40)) inputs |= (1 << 18); // Service
+
+	printf("GGPO: Collected inputs: 0x%08x\n", inputs);
+
+	// TEST: Add some debug info about what keys should be pressed
+	if (inputs == 0) {
+		static int debug_counter = 0;
+		if (++debug_counter % 60 == 0) { // Print every 60 frames (once per second at 60fps)
+			printf("GGPO: No inputs detected. To test:\n");
+			printf("  - Press '5' to insert coin (Coin 1)\n");
+			printf("  - Press '1' to start Player 1\n");
+			printf("  - Use arrow keys for Player 1 movement\n");
+			printf("  - Press 'Ctrl' for Player 1 Button 1\n");
+			printf("  - Press 'Alt' for Player 1 Button 2\n");
+			printf("  - Press 'Space' for Player 1 Button 3\n");
+		}
+	}
 
 	return inputs;
 }
@@ -603,9 +744,14 @@ void tmnt_state::ggpo_update_inputs()
 	// Collect local inputs
 	uint32_t local_inputs = ggpo_collect_local_inputs();
 
-	// Add inputs to GGPO
+	// Add inputs to GGPO for the local player
 	int disconnect_flags = 0;
-	ggpo_add_local_input(m_ggpo_session, 0, &local_inputs, sizeof(local_inputs));
+	GGPOErrorCode add_result = ggpo_add_local_input(m_ggpo_session, 0, &local_inputs, sizeof(local_inputs));
+
+	if (!GGPO_SUCCEEDED(add_result)) {
+		printf("GGPO: Failed to add local input, error: %d\n", add_result);
+		return;
+	}
 
 	// Synchronize inputs with remote players
 	uint32_t inputs[2] = {0}; // Support for 2 players in GGPO session
@@ -618,6 +764,10 @@ void tmnt_state::ggpo_update_inputs()
 		m_current_inputs.player_inputs[0] = inputs[0];
 		m_current_inputs.player_inputs[1] = inputs[1];
 		m_current_inputs.frame_number = m_frame_number;
+
+		printf("GGPO: Synchronized inputs - Local: 0x%08x, Remote: 0x%08x\n", inputs[0], inputs[1]);
+	} else {
+		printf("GGPO: Failed to synchronize inputs, error: %d\n", result);
 	}
 }
 
@@ -635,10 +785,117 @@ void tmnt_state::ggpo_advance_game_frame()
 
 	if (GGPO_SUCCEEDED(result)) {
 		m_frame_number++;
+		printf("GGPO: Advanced to frame %d\n", m_frame_number);
+
+		// Mark GGPO inputs as valid for this frame
+		m_ggpo_inputs_valid = true;
+
+		// Get synchronized inputs from both players
+		uint32_t player1_inputs = m_current_inputs.player_inputs[0]; // Player 1 (local or remote)
+		uint32_t player2_inputs = m_current_inputs.player_inputs[1]; // Player 2 (local or remote)
+
+		// Extract player inputs from the synchronized inputs
+		m_ggpo_override_inputs[0] = 0; // COINS
+		m_ggpo_override_inputs[1] = 0; // P1
+		m_ggpo_override_inputs[2] = 0; // P2
+		m_ggpo_override_inputs[3] = 0; // P3/P4
+
+		// Map Player 1 inputs (bits 0-7 from player1_inputs)
+		if (player1_inputs & (1 << 0)) m_ggpo_override_inputs[1] |= 0x01; // Up
+		if (player1_inputs & (1 << 1)) m_ggpo_override_inputs[1] |= 0x02; // Down
+		if (player1_inputs & (1 << 2)) m_ggpo_override_inputs[1] |= 0x04; // Left
+		if (player1_inputs & (1 << 3)) m_ggpo_override_inputs[1] |= 0x08; // Right
+		if (player1_inputs & (1 << 4)) m_ggpo_override_inputs[1] |= 0x10; // Button 1
+		if (player1_inputs & (1 << 5)) m_ggpo_override_inputs[1] |= 0x20; // Button 2
+		if (player1_inputs & (1 << 6)) m_ggpo_override_inputs[1] |= 0x40; // Button 3
+		if (player1_inputs & (1 << 7)) m_ggpo_override_inputs[1] |= 0x80; // Start
+
+		// Map Player 2 inputs (bits 8-15 from player2_inputs, but player2_inputs contains the raw P2 inputs)
+		if (player2_inputs & (1 << 8))  m_ggpo_override_inputs[2] |= 0x01; // Up
+		if (player2_inputs & (1 << 9))  m_ggpo_override_inputs[2] |= 0x02; // Down
+		if (player2_inputs & (1 << 10)) m_ggpo_override_inputs[2] |= 0x04; // Left
+		if (player2_inputs & (1 << 11)) m_ggpo_override_inputs[2] |= 0x08; // Right
+		if (player2_inputs & (1 << 12)) m_ggpo_override_inputs[2] |= 0x10; // Button 1
+		if (player2_inputs & (1 << 13)) m_ggpo_override_inputs[2] |= 0x20; // Button 2
+		if (player2_inputs & (1 << 14)) m_ggpo_override_inputs[2] |= 0x40; // Button 3
+		if (player2_inputs & (1 << 15)) m_ggpo_override_inputs[2] |= 0x80; // Start
+
+		// Combine coin inputs from both players (bits 16-18)
+		if ((player1_inputs & (1 << 16)) || (player2_inputs & (1 << 16))) m_ggpo_override_inputs[0] |= 0x01; // Coin 1
+		if ((player1_inputs & (1 << 17)) || (player2_inputs & (1 << 17))) m_ggpo_override_inputs[0] |= 0x02; // Coin 2
+		if ((player1_inputs & (1 << 18)) || (player2_inputs & (1 << 18))) m_ggpo_override_inputs[0] |= 0x40; // Service
+
+		printf("GGPO: Raw inputs - P1: 0x%08x, P2: 0x%08x\n", player1_inputs, player2_inputs);
+
+		// Invert bits for active-low inputs (TMNT uses active-low)
+		for (int i = 0; i < 4; i++) {
+			m_ggpo_override_inputs[i] = ~m_ggpo_override_inputs[i] & 0xff;
+		}
+
+		printf("GGPO: Frame %d - P1: 0x%02x, P2: 0x%02x, COINS: 0x%02x\n",
+			m_frame_number, m_ggpo_override_inputs[1], m_ggpo_override_inputs[2], m_ggpo_override_inputs[0]);
+	} else {
+		printf("GGPO: Failed to advance frame, error: %d\n", result);
 	}
 
 	// Idle GGPO to handle network events
 	ggpo_idle(m_ggpo_session, 0);
+}
+
+// GGPO input port override functions
+uint16_t tmnt_state::ggpo_coins_r()
+{
+	if (m_ggpo_enabled) {
+		printf("GGPO: Reading COINS - GGPO enabled, returning 0x%02x\n", m_ggpo_override_inputs[0]);
+		return m_ggpo_override_inputs[0];
+	}
+	uint16_t result = ioport("COINS")->read();
+	printf("GGPO: Reading COINS - GGPO disabled, returning 0x%02x\n", result);
+	return result;
+}
+
+uint16_t tmnt_state::ggpo_p1_r()
+{
+	if (m_ggpo_enabled) {
+		printf("GGPO: Reading P1 - GGPO enabled, returning 0x%02x\n", m_ggpo_override_inputs[1]);
+		return m_ggpo_override_inputs[1];
+	}
+	uint16_t result = ioport("P1")->read();
+	printf("GGPO: Reading P1 - GGPO disabled, returning 0x%02x\n", result);
+	return result;
+}
+
+uint16_t tmnt_state::ggpo_p2_r()
+{
+	if (m_ggpo_enabled) {
+		printf("GGPO: Reading P2 - GGPO enabled, returning 0x%02x\n", m_ggpo_override_inputs[2]);
+		return m_ggpo_override_inputs[2];
+	}
+	uint16_t result = ioport("P2")->read();
+	printf("GGPO: Reading P2 - GGPO disabled, returning 0x%02x\n", result);
+	return result;
+}
+
+uint16_t tmnt_state::ggpo_p3_r()
+{
+	if (m_ggpo_enabled) {
+		printf("GGPO: Reading P3 - GGPO enabled, returning 0x%02x\n", m_ggpo_override_inputs[3]);
+		return m_ggpo_override_inputs[3];
+	}
+	uint16_t result = ioport("P3")->read();
+	printf("GGPO: Reading P3 - GGPO disabled, returning 0x%02x\n", result);
+	return result;
+}
+
+uint16_t tmnt_state::ggpo_p4_r()
+{
+	if (m_ggpo_enabled) {
+		printf("GGPO: Reading P4 - GGPO enabled, returning 0x%02x\n", m_ggpo_override_inputs[3]);
+		return m_ggpo_override_inputs[3];
+	}
+	uint16_t result = ioport("P4")->read();
+	printf("GGPO: Reading P4 - GGPO disabled, returning 0x%02x\n", result);
+	return result;
 }
 
 
@@ -873,14 +1130,14 @@ void tmnt_state::tmnt_main_map(address_map &map)
 	map(0x000000, 0x05ffff).rom();
 	map(0x060000, 0x063fff).ram(); /* main RAM */
 	map(0x080000, 0x080fff).rw(m_palette, FUNC(palette_device::read8), FUNC(palette_device::write8)).umask16(0x00ff).share("palette");
-	map(0x0a0000, 0x0a0001).portr("COINS").w(FUNC(tmnt_state::tmnt_0a0000_w));
-	map(0x0a0002, 0x0a0003).portr("P1");
-	map(0x0a0004, 0x0a0005).portr("P2");
-	map(0x0a0006, 0x0a0007).portr("P3");
+	map(0x0a0000, 0x0a0001).r(FUNC(tmnt_state::ggpo_coins_r)).w(FUNC(tmnt_state::tmnt_0a0000_w));
+	map(0x0a0002, 0x0a0003).r(FUNC(tmnt_state::ggpo_p1_r));
+	map(0x0a0004, 0x0a0005).r(FUNC(tmnt_state::ggpo_p2_r));
+	map(0x0a0006, 0x0a0007).r(FUNC(tmnt_state::ggpo_p3_r));
 	map(0x0a0009, 0x0a0009).w("soundlatch", FUNC(generic_latch_8_device::write));
 	map(0x0a0010, 0x0a0011).portr("DSW1").w("watchdog", FUNC(watchdog_timer_device::reset16_w));
 	map(0x0a0012, 0x0a0013).portr("DSW2");
-	map(0x0a0014, 0x0a0015).portr("P4");
+	map(0x0a0014, 0x0a0015).r(FUNC(tmnt_state::ggpo_p4_r));
 	map(0x0a0018, 0x0a0019).portr("DSW3");
 	map(0x0c0000, 0x0c0001).w(FUNC(tmnt_state::tmnt_priority_w));
 	map(0x100000, 0x107fff).rw(FUNC(tmnt_state::k052109_word_noA12_r), FUNC(tmnt_state::k052109_word_noA12_w));
@@ -1179,17 +1436,16 @@ void tmnt_state::machine_start()
 
 	// Initialize GGPO session if enabled via command line
 	// Check for GGPO command line options
-	const char* ggpo_enable = machine().options().value("ggpo");
-	if (ggpo_enable && strcmp(ggpo_enable, "1") == 0) {
-		ggpo_init_session();
-		printf("GGPO: Enabled via command line\n");
-	} else {
-		// For now, just reference the functions to avoid unused function warnings
-		if (false) {
+	try {
+		if (machine().options().bool_value("ggpo")) {
+			printf("GGPO: Command line option detected, initializing session...\n");
 			ggpo_init_session();
-			ggpo_shutdown_session();
-			ggpo_advance_game_frame();
+			printf("GGPO: Session initialization completed\n");
+		} else {
+			printf("GGPO: Command line option not set or false\n");
 		}
+	} catch (options_exception &ex) {
+		printf("GGPO: Option 'ggpo' not found in options: %s\n", ex.what());
 	}
 }
 
@@ -1200,6 +1456,15 @@ void tmnt_state::machine_reset()
 	m_irq5_mask = 0;
 	m_frame_number = 0;
 	m_maincpu->set_input_line(M68K_IRQ_5, CLEAR_LINE);
+}
+
+tmnt_state::~tmnt_state()
+{
+	// Clean up GGPO session when machine is destroyed
+	ggpo_shutdown_session();
+
+	// Clear the global instance pointer
+	s_ggpo_instance = nullptr;
 }
 
 
